@@ -1,0 +1,14 @@
+{
+  "name": "carolina-codes-php",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": "."
+  },
+  "install": "php -v",
+  "ports": [
+    {
+      "name": "api",
+      "port": 4021
+    }
+  ]
+}
