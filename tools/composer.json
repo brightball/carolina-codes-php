@@ -1,0 +1,16 @@
+{
+    "name": "carolina-codes/php-quality-tools",
+    "description": "Quality-gate tooling only. Not the API bootstrap.",
+    "type": "project",
+    "license": "proprietary",
+    "require": {
+        "php": ">=8.5"
+    },
+    "require-dev": {
+        "php-cs-fixer/shim": "^3.91",
+        "vimeo/psalm": "^6.13"
+    },
+    "config": {
+        "sort-packages": true
+    }
+}

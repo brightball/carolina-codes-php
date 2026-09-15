@@ -1,4 +1,5 @@
 <?php
+
 require __DIR__ . '/carolina.php';
 
 $failed = 0;
@@ -12,6 +13,56 @@ function expect(bool $cond, string $msg): void
         fwrite(STDERR, "FAIL: {$msg}\n");
         $failed++;
     }
+}
+
+/** @return list<string> */
+function precommit_hook_ids(string $yaml): array
+{
+    preg_match_all('/^\s+- id:\s*([A-Za-z0-9_-]+)\s*$/m', $yaml, $m);
+    return array_values($m[1]);
+}
+
+/** @return list<string> */
+function gitea_job_names(string $yml): array
+{
+    $names = [];
+    $inJobs = false;
+    foreach (explode("\n", $yml) as $line) {
+        if (preg_match('/^jobs:\s*$/', $line)) {
+            $inJobs = true;
+            continue;
+        }
+        if ($inJobs) {
+            if (preg_match('/^[A-Za-z]/', $line)) {
+                break;
+            }
+            if (preg_match('/^  ([A-Za-z0-9_-]+):\s*$/', $line, $m)) {
+                $names[] = $m[1];
+            }
+        }
+    }
+    return $names;
+}
+
+/** @return list<string> */
+function makefile_phony_targets(string $makefile): array
+{
+    if (!preg_match('/^\.PHONY:\s*(.+)$/m', $makefile, $m)) {
+        return [];
+    }
+    return preg_split('/\s+/', trim($m[1])) ?: [];
+}
+
+function yaml_without_comments(string $yml): string
+{
+    $out = [];
+    foreach (explode("\n", $yml) as $line) {
+        if (preg_match('/^\s*#/', $line)) {
+            continue;
+        }
+        $out[] = $line;
+    }
+    return implode("\n", $out);
 }
 
 $src = file_get_contents(__DIR__ . '/carolina.php');
@@ -96,6 +147,52 @@ expect($GLOBALS['SQL_COUNT'] > 0, 'year-scoped list hits catalog SQL');
 [$ys, $yp] = handle_get('/v1/sponsors', ['year' => '2026']);
 expect($ys === 200, 'year-scoped sponsors return 200');
 expect(isset($yp['data'][0]['tier']), 'year-scoped sponsor row includes tier');
+
+$required = ['test', 'sast', 'audit', 'secrets', 'lint'];
+$precommitPath = __DIR__ . '/.pre-commit-config.yaml';
+$workflowPath = __DIR__ . '/.gitea/workflows/precommit.yml';
+$makefilePath = __DIR__ . '/Makefile';
+expect(is_file($precommitPath), 'pre-commit config exists');
+expect(is_file($workflowPath), 'gitea workflow exists');
+expect(is_file($makefilePath), 'Makefile exists');
+expect(is_file(__DIR__ . '/.githooks/pre-commit'), 'githooks pre-commit exists');
+expect(is_file(__DIR__ . '/tools/composer.json'), 'tools-only composer.json exists');
+expect(is_file(__DIR__ . '/tools/composer.lock'), 'tools composer.lock exists');
+expect(!file_exists(__DIR__ . '/composer.json'), 'no Composer app bootstrap');
+expect(!str_contains($src, 'vendor/autoload'), 'app does not load Composer autoload');
+
+$precommit = file_get_contents($precommitPath);
+$workflow = file_get_contents($workflowPath);
+$workflowActive = yaml_without_comments($workflow);
+$makefile = file_get_contents($makefilePath);
+$hooks = precommit_hook_ids($precommit);
+$jobs = gitea_job_names($workflow);
+$targets = makefile_phony_targets($makefile);
+foreach ($required as $name) {
+    expect(in_array($name, $hooks, true), "precommit hook {$name}");
+    expect(in_array($name, $jobs, true), "gitea job {$name}");
+    expect(in_array($name, $targets, true), "makefile target {$name}");
+    expect(str_contains($precommit, "entry: make {$name}"), "precommit {$name} runs make {$name}");
+    expect(str_contains($workflow, "make {$name}"), "gitea invokes make {$name}");
+}
+$hookChecks = array_values(array_filter($hooks, fn ($id) => in_array($id, $required, true)));
+$jobChecks = array_values(array_filter($jobs, fn ($id) => in_array($id, $required, true)));
+sort($hookChecks);
+sort($jobChecks);
+expect($hookChecks === $jobChecks, 'gitea jobs match precommit check ids');
+expect(count($jobs) === count($hookChecks), 'gitea is not a single combined job');
+expect(!preg_match('/^\s+needs:/m', $workflowActive), 'gitea check jobs have no needs');
+expect(!str_contains($workflowActive, 'actions/checkout'), 'gitea does not use actions/checkout');
+expect(!preg_match('/\bgit init\b/', $workflowActive), 'gitea does not git init');
+expect(str_contains($workflowActive, 'GITHUB_SHA'), 'gitea clones GITHUB_SHA');
+expect(str_contains($workflow, 'github.token'), 'gitea clone uses job token');
+expect(!preg_match('/make check\b/', $workflowActive), 'gitea does not run combined make check');
+expect(str_contains($precommit, 'fail_fast: false'), 'pre-commit fail_fast is false');
+expect(str_contains($makefile, 'detect --source'), 'secrets target runs gitleaks detect');
+expect(str_contains($makefile, '--taint-analysis'), 'sast runs psalm taint analysis');
+expect(str_contains($makefile, 'audit --working-dir'), 'audit runs composer audit');
+expect(str_contains($makefile, 'php-cs-fixer'), 'lint runs php-cs-fixer');
+expect(str_contains($makefile, 'test.php'), 'test target runs test.php');
 
 if ($failed) {
     fwrite(STDERR, "handler tests failed\n");

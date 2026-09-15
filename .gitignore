@@ -1,2 +1,4 @@
 *.log
 .env
+/tools/vendor/
+.php-cs-fixer.cache

@@ -1,0 +1,17 @@
+<?xml version="1.0"?>
+<psalm
+    errorLevel="8"
+    phpVersion="8.5"
+    findUnusedBaselineEntry="false"
+    findUnusedCode="false"
+    findUnusedPsalmSuppress="false"
+>
+    <projectFiles>
+        <file name="carolina.php" />
+        <file name="router.php" />
+        <file name="server.php" />
+        <ignoreFiles>
+            <directory name="tools" />
+        </ignoreFiles>
+    </projectFiles>
+</psalm>

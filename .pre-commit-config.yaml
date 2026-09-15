@@ -1,0 +1,36 @@
+# Local pre-commit hooks. Emergency escape: SKIP=test,sast,audit,secrets,lint git commit
+# Install once: make hooks   (or: pre-commit install)
+fail_fast: false
+repos:
+  - repo: local
+    hooks:
+      - id: test
+        name: handler tests
+        language: system
+        entry: make test
+        pass_filenames: false
+        always_run: true
+      - id: sast
+        name: static security scanner
+        language: system
+        entry: make sast
+        pass_filenames: false
+        always_run: true
+      - id: audit
+        name: 3rd-party dependency scanner
+        language: system
+        entry: make audit
+        pass_filenames: false
+        always_run: true
+      - id: secrets
+        name: gitleaks
+        language: system
+        entry: make secrets
+        pass_filenames: false
+        always_run: true
+      - id: lint
+        name: php-cs-fixer
+        language: system
+        entry: make lint
+        pass_filenames: false
+        always_run: true

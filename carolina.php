@@ -1,4 +1,5 @@
 <?php
+
 /**
  * Carolina Code Conference polyglot API — raw PHP (built-in SAPI).
  * Read-only SQL against PostgreSQL v1_* views. No Composer framework.

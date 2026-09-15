@@ -1,4 +1,5 @@
 <?php
+
 /**
  * Process entry: register once, then the PHP built-in SAPI.
  */
