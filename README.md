@@ -2,7 +2,7 @@
 
 Read-only v1 polyglot API for Carolina Code Conference. **Raw PHP** (CLI + built-in SAPI, no Composer framework).
 
-Queries PostgreSQL `v1_*` views via PDO. Registers with Elixir once, then `php -S`.
+Queries PostgreSQL `v1_*` views via PDO. Listens with `php -S` (CLI opcache on), then registers with Elixir once in the background.
 
 ```bash
 DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/carolina_dev \
@@ -30,4 +30,4 @@ Quality-gate tooling lives under `tools/` (`composer.json` / `composer.lock`) an
 
 Pre-commit runs the same five checks (`test`, `sast`, `audit`, `secrets`, `lint`). Install once with `make hooks` (needs `pre-commit` and `gitleaks` on PATH). Emergency skip: `SKIP=test,sast,audit,secrets,lint git commit`.
 
-Gitea Actions (`.gitea/workflows/precommit.yml`) runs those five checks as parallel jobs.
+Gitea Actions (`.gitea/workflows/precommit.yml`) prepares the environment once, then runs those five checks as parallel jobs.

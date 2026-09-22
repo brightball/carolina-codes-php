@@ -1,7 +1,7 @@
 # Quality gates for carolina-codes-php (raw PHP, no Composer app bootstrap).
 # Tooling lives under tools/ (psalm, php-cs-fixer). App sources are the root *.php files.
 GITLEAKS_MISE := $(HOME)/.local/share/mise/installs/gitleaks/8.30.1
-export PATH := $(GITLEAKS_MISE):$(HOME)/.local/bin:$(PATH)
+export PATH := $(CURDIR)/.ci-bin:$(GITLEAKS_MISE):$(HOME)/.local/bin:$(PATH)
 
 COMPOSER ?= composer
 PHP ?= php
@@ -12,7 +12,7 @@ PHP_CS_FIXER := $(CURDIR)/tools/vendor/bin/php-cs-fixer
 .PHONY: tools test sast audit secrets lint fmt check hooks
 
 tools:
-	$(COMPOSER) install --working-dir=$(CURDIR)/tools --no-interaction --prefer-dist
+	@if [ ! -x "$(PSALM)" ]; then $(COMPOSER) install --working-dir=$(CURDIR)/tools --no-interaction --prefer-dist; fi
 
 test:
 	$(PHP) test.php

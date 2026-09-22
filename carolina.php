@@ -31,7 +31,16 @@ const TALK_COLS = 'slug, title, description, format, youtube_id, year, speaker_s
 $SQL_COUNT = 0;
 $CONNECT_COUNT = 0;
 $QUERY_FN = null;
+
+/** @var PDO|null */
 $PDO = null;
+
+/**
+ * Identity of the cached session. Replaced whenever the session is dropped.
+ *
+ * @var object|null
+ */
+$CONNECTION = null;
 
 function language_version(): string
 {
@@ -45,6 +54,9 @@ function reset_counts(): void
     $CONNECT_COUNT = 0;
 }
 
+/**
+ * @return array{0: string, 1: string, 2: string}
+ */
 function pdo_dsn(): array
 {
     $raw = getenv('DATABASE_URL') ?: 'postgres://postgres:postgres@127.0.0.1:5432/carolina_dev';
@@ -81,16 +93,124 @@ function pdo(): PDO
     return $PDO;
 }
 
-function db_query(string $sql, array $args = []): array
+/**
+ * Drop a cached Postgres session.
+ * Fly suspend/resume can leave the previous TCP connection dead.
+ */
+function pdo_discard(): void
 {
-    global $SQL_COUNT, $QUERY_FN;
-    $SQL_COUNT++;
+    global $PDO, $CONNECTION;
+    $PDO = null;
+    $CONNECTION = null;
+}
+
+function pdo_is_disconnect(PDOException $e): bool
+{
+    $states = [];
+    $code = (string) $e->getCode();
+    if ($code !== '' && $code !== '0') {
+        $states[] = $code;
+    }
+    $info = $e->errorInfo;
+    if (is_array($info) && isset($info[0]) && is_string($info[0]) && $info[0] !== '') {
+        $states[] = $info[0];
+    }
+    foreach ($states as $state) {
+        if (str_starts_with($state, '08') || $state === '57P01' || $state === '57P02' || $state === '57P03') {
+            return true;
+        }
+    }
+    $msg = strtolower($e->getMessage());
+    foreach ([
+        'server closed the connection',
+        'connection reset by peer',
+        'no connection to the server',
+        'terminating connection',
+        'ssl connection has been closed',
+        'could not connect to server',
+        'connection refused',
+        'broken pipe',
+        'gone away',
+        'lost connection',
+    ] as $needle) {
+        if (str_contains($msg, $needle)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function connection_acquire(): object
+{
+    global $QUERY_FN, $CONNECTION, $CONNECT_COUNT;
+    if (is_object($CONNECTION)) {
+        return $CONNECTION;
+    }
     if ($QUERY_FN !== null) {
-        return ($QUERY_FN)($sql, $args);
+        $CONNECT_COUNT++;
+        $CONNECTION = new stdClass();
+
+        return $CONNECTION;
+    }
+    pdo();
+    $CONNECTION = new stdClass();
+
+    return $CONNECTION;
+}
+
+/**
+ * @param array<int|string, mixed> $args
+ * @return list<array<string, mixed>>
+ */
+function db_execute(string $sql, array $args): array
+{
+    global $QUERY_FN;
+    connection_acquire();
+    if ($QUERY_FN !== null) {
+        $rows = ($QUERY_FN)($sql, $args);
+        if (!is_array($rows)) {
+            return [];
+        }
+        $out = [];
+        foreach ($rows as $row) {
+            if (is_array($row)) {
+                $out[] = $row;
+            }
+        }
+
+        return $out;
     }
     $stmt = pdo()->prepare($sql);
     $stmt->execute($args);
-    return $stmt->fetchAll();
+    $fetched = $stmt->fetchAll();
+    $out = [];
+    foreach ($fetched as $row) {
+        if (is_array($row)) {
+            $out[] = $row;
+        }
+    }
+
+    return $out;
+}
+
+/**
+ * @param array<int|string, mixed> $args
+ * @return list<array<string, mixed>>
+ */
+function db_query(string $sql, array $args = []): array
+{
+    global $SQL_COUNT;
+    $SQL_COUNT++;
+    try {
+        return db_execute($sql, $args);
+    } catch (PDOException $e) {
+        if (!pdo_is_disconnect($e)) {
+            throw $e;
+        }
+        pdo_discard();
+
+        return db_execute($sql, $args);
+    }
 }
 
 function db_query_one(string $sql, array $args = []): ?array
@@ -239,6 +359,23 @@ function list_speakers(?int $year = null): array
     return attach_year_tags(array_map('clean', $rows), $year);
 }
 
+/**
+ * JSON body for the built-in SAPI. Escapes taint so the response sink
+ * is the encoded document rather than raw query text.
+ *
+ * @psalm-taint-escape html
+ * @psalm-taint-escape has_quotes
+ */
+function encode_payload(mixed $payload): string
+{
+    $json = json_encode($payload, JSON_UNESCAPED_SLASHES);
+    if (!is_string($json)) {
+        return '{}';
+    }
+
+    return $json;
+}
+
 function identity(): array
 {
     return [
@@ -340,6 +477,12 @@ function handle_get(string $path, array $qs = []): array
 
 function register_with_elixir(): void
 {
+    static $started = false;
+    if ($started) {
+        return;
+    }
+    $started = true;
+
     $url = getenv('CAROLINA_URL') ?: '';
     $token = getenv('POLYGLOT_REGISTER_TOKEN') ?: '';
     if ($url === '' || $token === '') {
@@ -348,6 +491,11 @@ function register_with_elixir(): void
     $port = getenv('PORT') ?: '4021';
     $base = getenv('PUBLIC_BASE_URL') ?: "http://127.0.0.1:{$port}";
     $body = json_encode(identity() + ['base_url' => $base]);
+    if (!is_string($body)) {
+        fwrite(STDERR, "register: failed\n");
+
+        return;
+    }
     $ctx = stream_context_create([
         'http' => [
             'method' => 'POST',
@@ -357,9 +505,15 @@ function register_with_elixir(): void
             'ignore_errors' => true,
         ],
     ]);
+    /** @var list<string> $http_response_header */
+    $http_response_header = [];
     $resp = @file_get_contents(rtrim($url, '/') . '/internal/api-endpoints/register', false, $ctx);
     $code = 0;
-    if (isset($http_response_header[0]) && preg_match('/\s(\d{3})\s/', $http_response_header[0], $m)) {
+    $statusLine = '';
+    if (isset($http_response_header[0]) && is_string($http_response_header[0])) {
+        $statusLine = $http_response_header[0];
+    }
+    if (preg_match('/\s(\d{3})\s/', $statusLine, $m) === 1) {
         $code = (int) $m[1];
     }
     fwrite(STDERR, $resp !== false ? "registered with elixir: {$code}\n" : "register: failed\n");

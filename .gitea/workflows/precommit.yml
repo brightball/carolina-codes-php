@@ -1,6 +1,15 @@
-# One Gitea Actions job per quality-gate check. Not a single combined job.
+# One Gitea Actions job per quality-gate check, after a shared prepare job.
+# Not a single combined job.
 #
-# act_runner starts a new container per job and blocks host bind-mounts.
+# act_runner starts a new container per job, so jobs cannot share a live
+# filesystem. Prepare clones GITHUB_SHA with the job token, installs
+# Composer, tools/ vendor, and gitleaks, then publishes a workspace
+# tarball through the Gitea artifact API (stdlib PHP, no Node).
+# Official Node artifact actions treat Gitea as GHES and abort.
+#
+# Check jobs restore that environment and run only their make target.
+# They do not needs: each other, so they run in parallel after prepare.
+#
 # Empty PHP image: clone GITHUB_SHA with the job token over HTTPS.
 # Gitea git HTTP returns 401 without the token. Do not git init or use
 # actions/checkout here.
@@ -18,14 +27,14 @@ env:
   GITHUB_TOKEN: ${{ github.token }}
 
 jobs:
-  test:
+  prepare:
     runs-on: ubuntu-latest
     container:
       image: docker.io/library/php:8.5-cli
       env:
         GITHUB_TOKEN: ${{ github.token }}
     steps:
-      - run: apt-get update -qq && apt-get install -y --no-install-recommends git ca-certificates make
+      - run: apt-get update -qq && apt-get install -y --no-install-recommends git ca-certificates make unzip curl tar gzip
       - run: |
           token="${GITHUB_TOKEN:-${GITEA_TOKEN:-}}"
           if [ -z "$token" ]; then echo "missing job token for git fetch" >&2; exit 1; fi
@@ -34,83 +43,164 @@ jobs:
           git clone --depth 1 --no-checkout "https://x-access-token:${token}@${host}/${GITHUB_REPOSITORY}" .
           git fetch --depth 1 origin "${GITHUB_SHA}"
           git checkout --force FETCH_HEAD
-      - run: make test
-
-  sast:
-    runs-on: ubuntu-latest
-    container:
-      image: docker.io/library/php:8.5-cli
-      env:
-        GITHUB_TOKEN: ${{ github.token }}
-    steps:
-      - run: apt-get update -qq && apt-get install -y --no-install-recommends git ca-certificates make unzip curl
-      - run: |
-          token="${GITHUB_TOKEN:-${GITEA_TOKEN:-}}"
-          if [ -z "$token" ]; then echo "missing job token for git fetch" >&2; exit 1; fi
-          host="${GITHUB_SERVER_URL#https://}"
-          host="${host#http://}"
-          git clone --depth 1 --no-checkout "https://x-access-token:${token}@${host}/${GITHUB_REPOSITORY}" .
-          git fetch --depth 1 origin "${GITHUB_SHA}"
-          git checkout --force FETCH_HEAD
+          git remote set-url origin "https://${host}/${GITHUB_REPOSITORY}"
       - run: curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
-      - run: make sast
-
-  audit:
-    runs-on: ubuntu-latest
-    container:
-      image: docker.io/library/php:8.5-cli
-      env:
-        GITHUB_TOKEN: ${{ github.token }}
-    steps:
-      - run: apt-get update -qq && apt-get install -y --no-install-recommends git ca-certificates make unzip curl
-      - run: |
-          token="${GITHUB_TOKEN:-${GITEA_TOKEN:-}}"
-          if [ -z "$token" ]; then echo "missing job token for git fetch" >&2; exit 1; fi
-          host="${GITHUB_SERVER_URL#https://}"
-          host="${host#http://}"
-          git clone --depth 1 --no-checkout "https://x-access-token:${token}@${host}/${GITHUB_REPOSITORY}" .
-          git fetch --depth 1 origin "${GITHUB_SHA}"
-          git checkout --force FETCH_HEAD
-      - run: curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
-      - run: make audit
-
-  secrets:
-    runs-on: ubuntu-latest
-    container:
-      image: docker.io/library/php:8.5-cli
-      env:
-        GITHUB_TOKEN: ${{ github.token }}
-    steps:
-      - run: apt-get update -qq && apt-get install -y --no-install-recommends git ca-certificates make curl tar gzip
-      - run: |
-          token="${GITHUB_TOKEN:-${GITEA_TOKEN:-}}"
-          if [ -z "$token" ]; then echo "missing job token for git fetch" >&2; exit 1; fi
-          host="${GITHUB_SERVER_URL#https://}"
-          host="${host#http://}"
-          git clone --depth 1 --no-checkout "https://x-access-token:${token}@${host}/${GITHUB_REPOSITORY}" .
-          git fetch --depth 1 origin "${GITHUB_SHA}"
-          git checkout --force FETCH_HEAD
       - run: |
           curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz" \
             | tar -xz -C /usr/local/bin gitleaks
           gitleaks version
-      - run: make secrets
+      - run: make tools
+      - run: |
+          mkdir -p .ci-bin
+          cp "$(command -v make)" .ci-bin/make
+          cp "$(command -v composer)" .ci-bin/composer
+          cp "$(command -v gitleaks)" .ci-bin/gitleaks
+          chmod +x .ci-bin/make .ci-bin/composer .ci-bin/gitleaks
+          tar -czf /tmp/prepared-env.tar.gz .
+          mv /tmp/prepared-env.tar.gz prepared-env.tar.gz
+          php scripts/ci_artifact.php upload prepared-env prepared-env.tar.gz
 
-  lint:
+  test:
+    needs: prepare
     runs-on: ubuntu-latest
     container:
       image: docker.io/library/php:8.5-cli
       env:
         GITHUB_TOKEN: ${{ github.token }}
     steps:
-      - run: apt-get update -qq && apt-get install -y --no-install-recommends git ca-certificates make unzip curl
       - run: |
+          set -euo pipefail
           token="${GITHUB_TOKEN:-${GITEA_TOKEN:-}}"
-          if [ -z "$token" ]; then echo "missing job token for git fetch" >&2; exit 1; fi
-          host="${GITHUB_SERVER_URL#https://}"
-          host="${host#http://}"
-          git clone --depth 1 --no-checkout "https://x-access-token:${token}@${host}/${GITHUB_REPOSITORY}" .
-          git fetch --depth 1 origin "${GITHUB_SHA}"
-          git checkout --force FETCH_HEAD
-      - run: curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
+          if [ -z "$token" ]; then echo "missing job token to fetch ci_artifact.php" >&2; exit 1; fi
+          api="${GITHUB_SERVER_URL%/}/api/v1/repos/${GITHUB_REPOSITORY}/raw/scripts/ci_artifact.php?ref=${GITHUB_SHA}"
+          if ! curl -fsSL -H "Authorization: token ${token}" "$api" -o /tmp/ci_artifact.php || ! grep -q ci_artifact_download /tmp/ci_artifact.php; then
+            host="${GITHUB_SERVER_URL#https://}"
+            host="${host#http://}"
+            scheme=https
+            case "${GITHUB_SERVER_URL}" in http://*) scheme=http ;; esac
+            curl -fsSL "${scheme}://x-access-token:${token}@${host}/${GITHUB_REPOSITORY}/raw/commit/${GITHUB_SHA}/scripts/ci_artifact.php" -o /tmp/ci_artifact.php
+          fi
+          grep -q ci_artifact_download /tmp/ci_artifact.php
+          php /tmp/ci_artifact.php download prepared-env prepared-env.tar.gz
+          tar -xzf prepared-env.tar.gz
+          cp -f .ci-bin/make /usr/local/bin/make
+          cp -f .ci-bin/composer /usr/local/bin/composer
+          cp -f .ci-bin/gitleaks /usr/local/bin/gitleaks
+          chmod +x /usr/local/bin/make /usr/local/bin/composer /usr/local/bin/gitleaks
+      - run: make test
+
+  sast:
+    needs: prepare
+    runs-on: ubuntu-latest
+    container:
+      image: docker.io/library/php:8.5-cli
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - run: |
+          set -euo pipefail
+          token="${GITHUB_TOKEN:-${GITEA_TOKEN:-}}"
+          if [ -z "$token" ]; then echo "missing job token to fetch ci_artifact.php" >&2; exit 1; fi
+          api="${GITHUB_SERVER_URL%/}/api/v1/repos/${GITHUB_REPOSITORY}/raw/scripts/ci_artifact.php?ref=${GITHUB_SHA}"
+          if ! curl -fsSL -H "Authorization: token ${token}" "$api" -o /tmp/ci_artifact.php || ! grep -q ci_artifact_download /tmp/ci_artifact.php; then
+            host="${GITHUB_SERVER_URL#https://}"
+            host="${host#http://}"
+            scheme=https
+            case "${GITHUB_SERVER_URL}" in http://*) scheme=http ;; esac
+            curl -fsSL "${scheme}://x-access-token:${token}@${host}/${GITHUB_REPOSITORY}/raw/commit/${GITHUB_SHA}/scripts/ci_artifact.php" -o /tmp/ci_artifact.php
+          fi
+          grep -q ci_artifact_download /tmp/ci_artifact.php
+          php /tmp/ci_artifact.php download prepared-env prepared-env.tar.gz
+          tar -xzf prepared-env.tar.gz
+          cp -f .ci-bin/make /usr/local/bin/make
+          cp -f .ci-bin/composer /usr/local/bin/composer
+          cp -f .ci-bin/gitleaks /usr/local/bin/gitleaks
+          chmod +x /usr/local/bin/make /usr/local/bin/composer /usr/local/bin/gitleaks
+      - run: make sast
+
+  audit:
+    needs: prepare
+    runs-on: ubuntu-latest
+    container:
+      image: docker.io/library/php:8.5-cli
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - run: |
+          set -euo pipefail
+          token="${GITHUB_TOKEN:-${GITEA_TOKEN:-}}"
+          if [ -z "$token" ]; then echo "missing job token to fetch ci_artifact.php" >&2; exit 1; fi
+          api="${GITHUB_SERVER_URL%/}/api/v1/repos/${GITHUB_REPOSITORY}/raw/scripts/ci_artifact.php?ref=${GITHUB_SHA}"
+          if ! curl -fsSL -H "Authorization: token ${token}" "$api" -o /tmp/ci_artifact.php || ! grep -q ci_artifact_download /tmp/ci_artifact.php; then
+            host="${GITHUB_SERVER_URL#https://}"
+            host="${host#http://}"
+            scheme=https
+            case "${GITHUB_SERVER_URL}" in http://*) scheme=http ;; esac
+            curl -fsSL "${scheme}://x-access-token:${token}@${host}/${GITHUB_REPOSITORY}/raw/commit/${GITHUB_SHA}/scripts/ci_artifact.php" -o /tmp/ci_artifact.php
+          fi
+          grep -q ci_artifact_download /tmp/ci_artifact.php
+          php /tmp/ci_artifact.php download prepared-env prepared-env.tar.gz
+          tar -xzf prepared-env.tar.gz
+          cp -f .ci-bin/make /usr/local/bin/make
+          cp -f .ci-bin/composer /usr/local/bin/composer
+          cp -f .ci-bin/gitleaks /usr/local/bin/gitleaks
+          chmod +x /usr/local/bin/make /usr/local/bin/composer /usr/local/bin/gitleaks
+      - run: make audit
+
+  secrets:
+    needs: prepare
+    runs-on: ubuntu-latest
+    container:
+      image: docker.io/library/php:8.5-cli
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - run: |
+          set -euo pipefail
+          token="${GITHUB_TOKEN:-${GITEA_TOKEN:-}}"
+          if [ -z "$token" ]; then echo "missing job token to fetch ci_artifact.php" >&2; exit 1; fi
+          api="${GITHUB_SERVER_URL%/}/api/v1/repos/${GITHUB_REPOSITORY}/raw/scripts/ci_artifact.php?ref=${GITHUB_SHA}"
+          if ! curl -fsSL -H "Authorization: token ${token}" "$api" -o /tmp/ci_artifact.php || ! grep -q ci_artifact_download /tmp/ci_artifact.php; then
+            host="${GITHUB_SERVER_URL#https://}"
+            host="${host#http://}"
+            scheme=https
+            case "${GITHUB_SERVER_URL}" in http://*) scheme=http ;; esac
+            curl -fsSL "${scheme}://x-access-token:${token}@${host}/${GITHUB_REPOSITORY}/raw/commit/${GITHUB_SHA}/scripts/ci_artifact.php" -o /tmp/ci_artifact.php
+          fi
+          grep -q ci_artifact_download /tmp/ci_artifact.php
+          php /tmp/ci_artifact.php download prepared-env prepared-env.tar.gz
+          tar -xzf prepared-env.tar.gz
+          cp -f .ci-bin/make /usr/local/bin/make
+          cp -f .ci-bin/composer /usr/local/bin/composer
+          cp -f .ci-bin/gitleaks /usr/local/bin/gitleaks
+          chmod +x /usr/local/bin/make /usr/local/bin/composer /usr/local/bin/gitleaks
+      - run: make secrets
+
+  lint:
+    needs: prepare
+    runs-on: ubuntu-latest
+    container:
+      image: docker.io/library/php:8.5-cli
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - run: |
+          set -euo pipefail
+          token="${GITHUB_TOKEN:-${GITEA_TOKEN:-}}"
+          if [ -z "$token" ]; then echo "missing job token to fetch ci_artifact.php" >&2; exit 1; fi
+          api="${GITHUB_SERVER_URL%/}/api/v1/repos/${GITHUB_REPOSITORY}/raw/scripts/ci_artifact.php?ref=${GITHUB_SHA}"
+          if ! curl -fsSL -H "Authorization: token ${token}" "$api" -o /tmp/ci_artifact.php || ! grep -q ci_artifact_download /tmp/ci_artifact.php; then
+            host="${GITHUB_SERVER_URL#https://}"
+            host="${host#http://}"
+            scheme=https
+            case "${GITHUB_SERVER_URL}" in http://*) scheme=http ;; esac
+            curl -fsSL "${scheme}://x-access-token:${token}@${host}/${GITHUB_REPOSITORY}/raw/commit/${GITHUB_SHA}/scripts/ci_artifact.php" -o /tmp/ci_artifact.php
+          fi
+          grep -q ci_artifact_download /tmp/ci_artifact.php
+          php /tmp/ci_artifact.php download prepared-env prepared-env.tar.gz
+          tar -xzf prepared-env.tar.gz
+          cp -f .ci-bin/make /usr/local/bin/make
+          cp -f .ci-bin/composer /usr/local/bin/composer
+          cp -f .ci-bin/gitleaks /usr/local/bin/gitleaks
+          chmod +x /usr/local/bin/make /usr/local/bin/composer /usr/local/bin/gitleaks
       - run: make lint

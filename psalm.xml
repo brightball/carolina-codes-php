@@ -1,6 +1,6 @@
 <?xml version="1.0"?>
 <psalm
-    errorLevel="8"
+    errorLevel="4"
     phpVersion="8.5"
     findUnusedBaselineEntry="false"
     findUnusedCode="false"
@@ -10,6 +10,7 @@
         <file name="carolina.php" />
         <file name="router.php" />
         <file name="server.php" />
+        <file name="scripts/ci_artifact.php" />
         <ignoreFiles>
             <directory name="tools" />
         </ignoreFiles>
