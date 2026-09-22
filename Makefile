@@ -25,7 +25,7 @@ audit:
 	$(COMPOSER) audit --working-dir=$(CURDIR)/tools --locked
 
 secrets:
-	$(GITLEAKS) detect --source $(CURDIR) --verbose --redact
+	$(GITLEAKS) detect --source $(CURDIR) --no-git --verbose --redact
 
 lint: tools
 	cd $(CURDIR)/tools && $(PHP_CS_FIXER) fix --config=$(CURDIR)/.php-cs-fixer.php --dry-run --diff --ansi
